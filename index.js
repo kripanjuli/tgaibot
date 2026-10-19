@@ -19,8 +19,9 @@ if (!NVIDIA_API_KEY || !TELEGRAM_BOT_TOKEN || !DATABASE_URL) {
 const openai = new OpenAI({
   apiKey: NVIDIA_API_KEY,
   baseURL: 'https://integrate.api.nvidia.com/v1',
-  timeout: 120_000,
-  maxRetries: 2
+  // Reduced timeout to 30s so it fails fast and triggers the fallback
+  timeout: 30_000,
+  maxRetries: 1
 });
 
 const pool = new Pool({
@@ -51,6 +52,14 @@ const freeModels = new Set(FREE_MODELS.split(',').map(s => s.trim()).filter(Bool
 const cache = { models: [], at: 0 };
 const PAGE_SIZE = 8;
 const MAX_HISTORY = 16;
+
+// This is the fallback list of known fast, responsive models on NVIDIA NIM
+const FAST_MODELS = [
+  'z-ai/glm-5.3-flash', 
+  'meta/llama-3.1-8b-instruct',
+  'mistralai/mistral-7b-instruct-v0.3',
+  'microsoft/phi-3-mini-128k-instruct'
+];
 
 async function initDb() {
   await pool.query(`
@@ -139,33 +148,17 @@ async function showModels(msg, page = 0, editId = null) {
   return bot.sendMessage(msg.chat.id, text, opts);
 }
 
-// NEW: Convert AI Standard Markdown to Telegram HTML
 function markdownToHtml(text) {
   let html = text;
-  
-  // 1. Escape HTML tags to prevent errors
   html = html.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-
-  // 2. Convert bullet points (* or - at start of line) to • 
   html = html.replace(/^\s*[*|-]\s+(.*?)$/gm, '• $1');
-
-  // 3. Convert Bold (**text** or __text__) to <b>text</b>
   html = html.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
   html = html.replace(/__(.*?)__/g, '<b>$1</b>');
-
-  // 4. Convert Italic (*text* or _text_) to <i>text</i>
   html = html.replace(/\*(.*?)\*/g, '<i>$1</i>');
   html = html.replace(/_(.*?)_/g, '<i>$1</i>');
-
-  // 5. Convert Inline Code (`code`) to <code>code</code>
   html = html.replace(/`(.*?)`/g, '<code>$1</code>');
-
-  // 6. Convert Code Blocks (```code```) to <pre>code</pre>
   html = html.replace(/```([\s\S]*?)```/g, '<pre>$1</pre>');
-
-  // 7. Convert Links [text](url) to <a href="url">text</a>
   html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
-
   return html;
 }
 
@@ -174,13 +167,11 @@ async function sendLong(chat, content) {
   for (let part of chunks) {
     const htmlPart = markdownToHtml(part);
     try {
-      // Send with HTML formatting and disable big link previews
       await bot.sendMessage(chat, htmlPart, { 
         parse_mode: 'HTML',
         disable_web_page_preview: true 
       });
     } catch (error) {
-      // Fallback to plain text if parsing somehow fails
       await bot.sendMessage(chat, part);
     }
   }
@@ -190,12 +181,21 @@ bot.onText(/^\/start(?:@\w+)?$/, async msg => {
   if (!permitted(msg)) return bot.sendMessage(msg.chat.id, '⛔ Access denied.');
   const s = await getSettings(msg);
   await bot.sendMessage(msg.chat.id,
-    `👋 *NVIDIA AI Bot*\n\nSelected model: \`${s.model_id}\`\nLock: ${s.model_locked ? '🔒 locked' : '🔓 unlocked'}\n\n/models — browse models\n/model — current model\n/lock — lock selection\n/unlock — unlock selection\n/reset — clear saved conversation\n/admin — admin controls\n/help — commands`,
+    `👋 *NVIDIA AI Bot*\n\nSelected model: \`${s.model_id}\`\nLock: ${s.model_locked ? '🔒 locked' : '🔓 unlocked'}\n\n/models — browse models\n/auto — auto-select a fast model\n/model — current model\n/lock — lock selection\n/unlock — unlock selection\n/reset — clear saved conversation\n/admin — admin controls\n/help — commands`,
     { parse_mode: 'Markdown' });
 });
 
 bot.onText(/^\/help(?:@\w+)?$/, msg => {
-  if (permitted(msg)) bot.sendMessage(msg.chat.id, '/models, /model, /lock, /unlock, /reset, /admin, /stats');
+  if (permitted(msg)) bot.sendMessage(msg.chat.id, '/models, /auto, /model, /lock, /unlock, /reset, /admin, /stats');
+});
+
+// NEW: Fast /auto command
+bot.onText(/^\/auto(?:@\w+)?$/, async msg => {
+  if (!permitted(msg)) return;
+  await getSettings(msg);
+  const autoModel = freeModels.values().next().value || 'meta/llama-3.1-8b-instruct';
+  await setSetting(msg, 'model', autoModel);
+  bot.sendMessage(msg.chat.id, `⚡ Automatically selected the fastest available model: \`${autoModel}\``, { parse_mode: 'Markdown' });
 });
 
 bot.onText(/^\/models(?:@\w+)?$/, async msg => {
@@ -312,29 +312,62 @@ bot.on('message', async msg => {
     const messages = rows.reverse();
     const status = await bot.sendMessage(msg.chat.id, `⏳ Thinking with ${settings.model_id}…`);
     
+    // SMART FALLBACK SYSTEM
+    // 1. Try the user's selected model.
+    // 2. If it fails/times out, loop through known fast models.
+    const modelsToTry = [...new Set([settings.model_id, ...FAST_MODELS])];
+    let successfulModel = null;
     let output = '';
-    try {
-      const stream = await openai.chat.completions.create({
-        model: settings.model_id, messages, temperature: 0.5, top_p: 1,
-        max_tokens: 1024, stream: true
-      });
-      
-      for await (const chunk of stream) {
-        output += chunk.choices?.[0]?.delta?.content || '';
+    let lastError = null;
+
+    for (const modelId of modelsToTry) {
+      try {
+        // Update the status message if we are on a fallback attempt
+        if (modelId !== settings.model_id) {
+          await bot.editMessageText(`⚠️ Model timed out. Retrying with faster model: ${modelId}…`, {
+            chat_id: msg.chat.id, message_id: status.message_id
+          }).catch(() => {});
+        }
+
+        const stream = await openai.chat.completions.create({
+          model: modelId, messages, temperature: 0.5, top_p: 1,
+          max_tokens: 1024, stream: true
+        });
+        
+        let tempOutput = '';
+        for await (const chunk of stream) {
+          tempOutput += chunk.choices?.[0]?.delta?.content || '';
+        }
+        
+        if (tempOutput.trim()) {
+          output = tempOutput;
+          successfulModel = modelId;
+          break; // Success! Exit the loop.
+        }
+      } catch (err) {
+        console.error(`Model ${modelId} failed:`, err.message);
+        lastError = err;
       }
-      
-      if (!output.trim()) output = '(The model returned an empty response.)';
-      
+    }
+
+    if (successfulModel) {
       await pool.query('INSERT INTO chat_messages (telegram_user_id, role, content) VALUES ($1,$2,$3)', [uid, 'assistant', output]);
       await bot.deleteMessage(msg.chat.id, status.message_id).catch(() => {});
-      await sendLong(msg.chat.id, output);
       
-    } catch (e) {
-      console.error('Inference error:', e?.status, e?.message || e);
-      await bot.editMessageText(`❌ Model request failed: ${String(e?.message || e).slice(0, 700)}`, {
+      // If we had to fallback, send a little warning first
+      if (successfulModel !== settings.model_id) {
+        await bot.sendMessage(msg.chat.id, `⚠️ *Note:* Your selected model failed or timed out. I automatically used \`${successfulModel}\` instead.`, { parse_mode: 'Markdown' });
+      }
+      
+      await sendLong(msg.chat.id, output);
+    } else {
+      // If even the fast fallback models failed
+      const errorMsg = lastError?.message || 'Unknown error';
+      await bot.editMessageText(`❌ All models failed. Last error: ${String(errorMsg).slice(0, 700)}`, {
         chat_id: msg.chat.id, message_id: status.message_id
       }).catch(() => {});
     }
+      
   } catch (e) {
     console.error('Message/database error:', e);
     bot.sendMessage(msg.chat.id, '❌ Service error. Please try again later.').catch(() => {});
