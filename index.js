@@ -19,7 +19,7 @@ if (!NVIDIA_API_KEY || !TELEGRAM_BOT_TOKEN || !DATABASE_URL) {
 const openai = new OpenAI({
   apiKey: NVIDIA_API_KEY,
   baseURL: 'https://integrate.api.nvidia.com/v1',
-  timeout: 45_000,
+  timeout: 60_000, // Increased slightly for image processing
   maxRetries: 1
 });
 
@@ -51,11 +51,18 @@ const cache = { models: [], at: 0 };
 const PAGE_SIZE = 8;
 const MAX_HISTORY = 16;
 
+// Fallback text models
 const FAST_MODELS = [
   'z-ai/glm-5.3-flash', 
   'meta/llama-3.1-70b-instruct',
-  'mistralai/mistral-7b-instruct-v0.3',
-  'google/gemma-2-9b-it'
+  'mistralai/mistral-7b-instruct-v0.3'
+];
+
+// Fallback Vision models (for Images/OCR)
+const VISION_MODELS = [
+  'meta/llama-3.2-11b-vision-instruct',
+  'microsoft/phi-3.5-vision-instruct',
+  'meta/llama-3.2-90b-vision-instruct'
 ];
 
 async function initDb() {
@@ -185,7 +192,7 @@ bot.onText(/^\/start(?:@\w+)?$/, async msg => {
       `👋 *Welcome back, Admin!*\n\nSelected model: \`${s.model_id}\`\nLock: ${s.model_locked ? '🔒 locked' : '🔓 unlocked'}\n\nUse /help to see the command menu.`,
       { parse_mode: 'Markdown' });
   } else {
-    await bot.sendMessage(msg.chat.id, `👋 *Welcome to NVIDIA AI Bot!*\n\nJust send me a message and I will reply using AI.`);
+    await bot.sendMessage(msg.chat.id, `👋 *Welcome to NVIDIA AI Bot!*\n\n💬 Send me a text message to chat.\n🖼 Send me an image for OCR or image analysis!`);
   }
 });
 
@@ -194,8 +201,6 @@ bot.onText(/^\/help(?:@\w+)?$/, msg => {
   
   const helpText = `
 👑 *Admin Command Center*
-
-Here are the commands you can use to manage the bot:
 
 🤖 *Model Settings*
 • /models — Browse and select AI models
@@ -212,33 +217,26 @@ Here are the commands you can use to manage the bot:
 • /stats — View bot usage statistics
 • /broadcast <msg> — Message all users
 
-💡 _Note: Regular users are restricted to chatting with the AI only. They cannot use these commands._
+🖼 *Vision Support:* Users can send images directly to the bot for OCR (Text Extraction) or analysis. Note: Text models won't see the image, the bot automatically routes images to Vision models.
   `;
   
   bot.sendMessage(msg.chat.id, helpText, { parse_mode: 'Markdown' });
 });
 
-// --- NEW /locked COMMAND ---
 bot.onText(/^\/locked(?:@\w+)?$/, async msg => {
   if (!admin(msg)) return bot.sendMessage(msg.chat.id, '⛔ Admin only.');
-  
   const s = await getSettings(msg);
   
   if (!s.model_locked) {
     return bot.sendMessage(msg.chat.id, `🔓 You do not have a locked model right now.\n\nYour current active model is: \`${s.model_id}\`\n\nUse /lock if you want to lock it.`, { parse_mode: 'Markdown' });
   }
-  
   bot.sendMessage(msg.chat.id, `🔒 *Your currently locked AI model is:*\n\n\`${s.model_id}\`\n\nUse /unlock if you want to change it.`, { parse_mode: 'Markdown' });
 });
 
 bot.onText(/^\/models(?:@\w+)?$/, async msg => {
   if (!admin(msg)) return bot.sendMessage(msg.chat.id, '⛔ Admin only.');
-  try { 
-    await showModels(msg); 
-  } catch (e) { 
-    console.error(e); 
-    bot.sendMessage(msg.chat.id, `Model list error: ${e.message}`); 
-  }
+  try { await showModels(msg); } 
+  catch (e) { bot.sendMessage(msg.chat.id, `Model list error: ${e.message}`); }
 });
 
 bot.onText(/^\/model(?:@\w+)?$/, async msg => {
@@ -288,18 +286,14 @@ bot.onText(/^\/broadcast(?:@\w+)?\s+([\s\S]+)/, async (msg, match) => {
     try { 
       await bot.sendMessage(row.chat_id, match[1].slice(0, 3900)); 
       sent++; 
-    } catch (e) { 
-      console.error('Broadcast failed for chat', row.chat_id, e.message); 
-    }
+    } catch (e) { console.error('Broadcast failed', e.message); }
   }
   bot.sendMessage(msg.chat.id, `Broadcast attempted. Sent: ${sent}/${rows.length}`);
 });
 
 bot.on('callback_query', async q => {
   if (!q.message) return bot.answerCallbackQuery(q.id, { text: 'Message unavailable', show_alert: true }).catch(() => {});
-  
   const msg = { ...q.message, from: q.from };
-  
   if (!permitted(msg) || !admin(msg)) return bot.answerCallbackQuery(q.id, { text: 'Admin only', show_alert: true });
   
   try {
@@ -329,32 +323,68 @@ bot.on('callback_query', async q => {
   }
 });
 
+// --- UPDATED MESSAGE HANDLER FOR TEXT AND IMAGES ---
 bot.on('message', async msg => {
-  const text = msg.text?.trim();
-  if (!text || text.startsWith('/') || !permitted(msg)) return;
+  const isPhoto = msg.photo && msg.photo.length > 0;
+  // If it's not a photo, it must be text and not a command
+  if (!isPhoto && (!msg.text || msg.text.startsWith('/'))) return;
+  if (!permitted(msg)) return;
   
   const uid = userId(msg);
+  const text = msg.text?.trim() || msg.caption?.trim() || 'Extract text from this image (OCR).';
+  const dbContent = isPhoto ? `[Image] ${text}` : text;
+
   try {
     const settings = await getSettings(msg);
-    await pool.query('INSERT INTO chat_messages (telegram_user_id, role, content) VALUES ($1,$2,$3)', [uid, 'user', text]);
+    await pool.query('INSERT INTO chat_messages (telegram_user_id, role, content) VALUES ($1,$2,$3)', [uid, 'user', dbContent]);
     
     const { rows } = await pool.query(
       'SELECT role, content FROM chat_messages WHERE telegram_user_id=$1 ORDER BY id DESC LIMIT $2',
       [uid, MAX_HISTORY]
     );
-    const messages = rows.reverse();
-    const status = await bot.sendMessage(msg.chat.id, `⏳ Thinking…`);
+    const history = rows.reverse();
     
-    const modelsToTry = [...new Set([settings.model_id, ...FAST_MODELS])];
+    const status = await bot.sendMessage(msg.chat.id, isPhoto ? `⏳ Analyzing image…` : `⏳ Thinking…`);
+    
+    // Determine which models to use
+    const modelsToTry = isPhoto 
+      ? VISION_MODELS 
+      : [...new Set([settings.model_id, ...FAST_MODELS])];
+
     let successfulModel = null;
     let output = '';
     let lastError = null;
 
+    // If it's a photo, prepare the image URL
+    let imageUrl = null;
+    if (isPhoto) {
+      const fileId = msg.photo[msg.photo.length - 1].file_id;
+      imageUrl = await bot.getFileLink(fileId);
+    }
+
     for (const modelId of modelsToTry) {
       try {
+        // Build message array. If photo, the current message uses vision format.
+        const currentApiMsg = isPhoto ? {
+          role: 'user',
+          content: [
+            { type: 'text', text: text },
+            { type: 'image_url', image_url: { url: imageUrl } }
+          ]
+        } : {
+          role: 'user',
+          content: text
+        };
+
+        const apiMessages = [...history.slice(0, -1), currentApiMsg];
+
         const stream = await openai.chat.completions.create({
-          model: modelId, messages, temperature: 0.5, top_p: 1,
-          max_tokens: 1024, stream: true
+          model: modelId, 
+          messages: apiMessages, 
+          temperature: 0.5, 
+          top_p: 1,
+          max_tokens: 1024, 
+          stream: true
         });
         
         let tempOutput = '';
@@ -377,15 +407,10 @@ bot.on('message', async msg => {
 
     if (successfulModel) {
       await pool.query('INSERT INTO chat_messages (telegram_user_id, role, content) VALUES ($1,$2,$3)', [uid, 'assistant', output]);
-      
-      if (successfulModel !== settings.model_id) {
-        await bot.sendMessage(msg.chat.id, `⚠️ *Note:* Your selected model failed or timed out. I automatically used \`${successfulModel}\` instead.`, { parse_mode: 'Markdown' });
-      }
-      
       await sendLong(msg.chat.id, output);
     } else {
       const errorMsg = lastError?.message || 'Unknown error';
-      await bot.sendMessage(msg.chat.id, `❌ All models failed. Last error: ${String(errorMsg).slice(0, 700)}`);
+      await bot.sendMessage(msg.chat.id, `❌ Request failed. Last error: ${String(errorMsg).slice(0, 700)}`);
     }
       
   } catch (e) {
