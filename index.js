@@ -7,7 +7,7 @@ import pg from 'pg';
 const { Pool } = pg;
 const {
   NVIDIA_API_KEY, TELEGRAM_BOT_TOKEN, DATABASE_URL,
-  ADMIN_TELEGRAM_IDS = '', FREE_MODELS = '',
+  ADMIN_TELEGRAM_IDS = '',
   ALLOWED_TELEGRAM_USER_IDS = '', PORT = 10000
 } = process.env;
 
@@ -19,8 +19,7 @@ if (!NVIDIA_API_KEY || !TELEGRAM_BOT_TOKEN || !DATABASE_URL) {
 const openai = new OpenAI({
   apiKey: NVIDIA_API_KEY,
   baseURL: 'https://integrate.api.nvidia.com/v1',
-  // Reduced timeout to 30s so it fails fast and triggers the fallback
-  timeout: 30_000,
+  timeout: 45_000,
   maxRetries: 1
 });
 
@@ -48,17 +47,16 @@ app.listen(Number(PORT), '0.0.0.0', () => console.log(`Health server listening o
 
 const admins = new Set(ADMIN_TELEGRAM_IDS.split(',').map(s => s.trim()).filter(Boolean));
 const allowed = new Set(ALLOWED_TELEGRAM_USER_IDS.split(',').map(s => s.trim()).filter(Boolean));
-const freeModels = new Set(FREE_MODELS.split(',').map(s => s.trim()).filter(Boolean));
 const cache = { models: [], at: 0 };
 const PAGE_SIZE = 8;
 const MAX_HISTORY = 16;
 
-// This is the fallback list of known fast, responsive models on NVIDIA NIM
+// Fast fallback models in case the selected one is too slow
 const FAST_MODELS = [
   'z-ai/glm-5.3-flash', 
-  'meta/llama-3.1-8b-instruct',
+  'meta/llama-3.1-70b-instruct',
   'mistralai/mistral-7b-instruct-v0.3',
-  'microsoft/phi-3-mini-128k-instruct'
+  'google/gemma-2-9b-it'
 ];
 
 async function initDb() {
@@ -123,7 +121,7 @@ function keyboard(models, page, settings) {
   page = Math.min(Math.max(page, 0), pages - 1);
   const start = page * PAGE_SIZE;
   const rows = models.slice(start, start + PAGE_SIZE).map((id, i) => [{
-    text: `${id === settings.model_id ? '✅ ' : ''}${freeModels.has(id) ? '🆓 ' : '🤖 '}${id.length > 42 ? id.slice(0, 39) + '…' : id}`,
+    text: `${id === settings.model_id ? '✅ ' : ''}🤖 ${id.length > 42 ? id.slice(0, 39) + '…' : id}`,
     callback_data: `pick|${page}|${start + i}`
   }]);
   const nav = [];
@@ -139,7 +137,9 @@ async function showModels(msg, page = 0, editId = null) {
   if (!models.length) throw new Error('No models returned for this API key.');
   const settings = await getSettings(msg);
   const pages = Math.max(1, Math.ceil(models.length / PAGE_SIZE));
-  const text = `🤖 *NVIDIA models*\nSelected: \`${settings.model_id}\`\nSelection: ${settings.model_locked ? '🔒 locked' : '🔓 unlocked'}\n\n🆓 = configured as free by administrator. 🤖 = pricing unverified.\nPage ${Math.min(page + 1, pages)}/${pages}`;
+  
+  const text = `🤖 *NVIDIA models*\nSelected: \`${settings.model_id}\`\nSelection: ${settings.model_locked ? '🔒 locked' : '🔓 unlocked'}\n\nPage ${Math.min(page + 1, pages)}/${pages}`;
+  
   const opts = { parse_mode: 'Markdown', reply_markup: keyboard(models, page, settings) };
   
   if (editId) {
@@ -179,27 +179,27 @@ async function sendLong(chat, content) {
 
 bot.onText(/^\/start(?:@\w+)?$/, async msg => {
   if (!permitted(msg)) return bot.sendMessage(msg.chat.id, '⛔ Access denied.');
-  const s = await getSettings(msg);
-  await bot.sendMessage(msg.chat.id,
-    `👋 *NVIDIA AI Bot*\n\nSelected model: \`${s.model_id}\`\nLock: ${s.model_locked ? '🔒 locked' : '🔓 unlocked'}\n\n/models — browse models\n/auto — auto-select a fast model\n/model — current model\n/lock — lock selection\n/unlock — unlock selection\n/reset — clear saved conversation\n/admin — admin controls\n/help — commands`,
-    { parse_mode: 'Markdown' });
+  
+  if (admin(msg)) {
+    const s = await getSettings(msg);
+    await bot.sendMessage(msg.chat.id,
+      `👋 *NVIDIA AI Bot (Admin)*\n\nSelected model: \`${s.model_id}\`\nLock: ${s.model_locked ? '🔒 locked' : '🔓 unlocked'}\n\n/models — browse models\n/model — current model\n/lock — lock selection\n/unlock — unlock selection\n/reset — clear saved conversation\n/help — commands`,
+      { parse_mode: 'Markdown' });
+  } else {
+    // Regular users see this
+    await bot.sendMessage(msg.chat.id, `👋 *Welcome to NVIDIA AI Bot!*\n\nJust send me a message and I will reply using AI.`);
+  }
 });
 
+// Help is strictly for admin now
 bot.onText(/^\/help(?:@\w+)?$/, msg => {
-  if (permitted(msg)) bot.sendMessage(msg.chat.id, '/models, /auto, /model, /lock, /unlock, /reset, /admin, /stats');
+  if (!admin(msg)) return bot.sendMessage(msg.chat.id, '⛔ Admin only.');
+  bot.sendMessage(msg.chat.id, '/models, /model, /lock, /unlock, /reset, /admin, /stats');
 });
 
-// NEW: Fast /auto command
-bot.onText(/^\/auto(?:@\w+)?$/, async msg => {
-  if (!permitted(msg)) return;
-  await getSettings(msg);
-  const autoModel = freeModels.values().next().value || 'meta/llama-3.1-8b-instruct';
-  await setSetting(msg, 'model', autoModel);
-  bot.sendMessage(msg.chat.id, `⚡ Automatically selected the fastest available model: \`${autoModel}\``, { parse_mode: 'Markdown' });
-});
-
+// Locked to Admin
 bot.onText(/^\/models(?:@\w+)?$/, async msg => {
-  if (!permitted(msg)) return bot.sendMessage(msg.chat.id, '⛔ Access denied.');
+  if (!admin(msg)) return bot.sendMessage(msg.chat.id, '⛔ Admin only.');
   try { 
     await showModels(msg); 
   } catch (e) { 
@@ -208,26 +208,30 @@ bot.onText(/^\/models(?:@\w+)?$/, async msg => {
   }
 });
 
+// Locked to Admin
 bot.onText(/^\/model(?:@\w+)?$/, async msg => {
-  if (!permitted(msg)) return;
+  if (!admin(msg)) return bot.sendMessage(msg.chat.id, '⛔ Admin only.');
   const s = await getSettings(msg);
-  bot.sendMessage(msg.chat.id, `Model: ${s.model_id}\nLock: ${s.model_locked ? '🔒 locked' : '🔓 unlocked'}\nPricing: ${freeModels.has(s.model_id) ? '🆓 configured free' : '🤖 not verified'}`);
+  bot.sendMessage(msg.chat.id, `Model: ${s.model_id}\nLock: ${s.model_locked ? '🔒 locked' : '🔓 unlocked'}`);
 });
 
+// Locked to Admin
 bot.onText(/^\/lock(?:@\w+)?$/, async msg => {
-  if (!permitted(msg)) return;
+  if (!admin(msg)) return bot.sendMessage(msg.chat.id, '⛔ Admin only.');
   await getSettings(msg); await setSetting(msg, 'lock', true);
   bot.sendMessage(msg.chat.id, '🔒 Your model selection is locked.');
 });
 
+// Locked to Admin
 bot.onText(/^\/unlock(?:@\w+)?$/, async msg => {
-  if (!permitted(msg)) return;
+  if (!admin(msg)) return bot.sendMessage(msg.chat.id, '⛔ Admin only.');
   await getSettings(msg); await setSetting(msg, 'lock', false);
   bot.sendMessage(msg.chat.id, '🔓 Model selection unlocked.');
 });
 
+// Locked to Admin
 bot.onText(/^\/reset(?:@\w+)?$/, async msg => {
-  if (!permitted(msg)) return;
+  if (!admin(msg)) return bot.sendMessage(msg.chat.id, '⛔ Admin only.');
   await pool.query('DELETE FROM chat_messages WHERE telegram_user_id=$1', [userId(msg)]);
   bot.sendMessage(msg.chat.id, '🧹 Your saved conversation history has been cleared.');
 });
@@ -267,7 +271,7 @@ bot.on('callback_query', async q => {
   
   const msg = { ...q.message, from: q.from };
   
-  if (!permitted(msg)) return bot.answerCallbackQuery(q.id, { text: 'Access denied', show_alert: true });
+  if (!permitted(msg) || !admin(msg)) return bot.answerCallbackQuery(q.id, { text: 'Admin only', show_alert: true });
   
   try {
     const s = await getSettings(msg);
@@ -310,11 +314,8 @@ bot.on('message', async msg => {
       [uid, MAX_HISTORY]
     );
     const messages = rows.reverse();
-    const status = await bot.sendMessage(msg.chat.id, `⏳ Thinking with ${settings.model_id}…`);
+    const status = await bot.sendMessage(msg.chat.id, `⏳ Thinking…`);
     
-    // SMART FALLBACK SYSTEM
-    // 1. Try the user's selected model.
-    // 2. If it fails/times out, loop through known fast models.
     const modelsToTry = [...new Set([settings.model_id, ...FAST_MODELS])];
     let successfulModel = null;
     let output = '';
@@ -322,13 +323,6 @@ bot.on('message', async msg => {
 
     for (const modelId of modelsToTry) {
       try {
-        // Update the status message if we are on a fallback attempt
-        if (modelId !== settings.model_id) {
-          await bot.editMessageText(`⚠️ Model timed out. Retrying with faster model: ${modelId}…`, {
-            chat_id: msg.chat.id, message_id: status.message_id
-          }).catch(() => {});
-        }
-
         const stream = await openai.chat.completions.create({
           model: modelId, messages, temperature: 0.5, top_p: 1,
           max_tokens: 1024, stream: true
@@ -342,7 +336,7 @@ bot.on('message', async msg => {
         if (tempOutput.trim()) {
           output = tempOutput;
           successfulModel = modelId;
-          break; // Success! Exit the loop.
+          break;
         }
       } catch (err) {
         console.error(`Model ${modelId} failed:`, err.message);
@@ -350,22 +344,19 @@ bot.on('message', async msg => {
       }
     }
 
+    await bot.deleteMessage(msg.chat.id, status.message_id).catch(() => {});
+
     if (successfulModel) {
       await pool.query('INSERT INTO chat_messages (telegram_user_id, role, content) VALUES ($1,$2,$3)', [uid, 'assistant', output]);
-      await bot.deleteMessage(msg.chat.id, status.message_id).catch(() => {});
       
-      // If we had to fallback, send a little warning first
       if (successfulModel !== settings.model_id) {
         await bot.sendMessage(msg.chat.id, `⚠️ *Note:* Your selected model failed or timed out. I automatically used \`${successfulModel}\` instead.`, { parse_mode: 'Markdown' });
       }
       
       await sendLong(msg.chat.id, output);
     } else {
-      // If even the fast fallback models failed
       const errorMsg = lastError?.message || 'Unknown error';
-      await bot.editMessageText(`❌ All models failed. Last error: ${String(errorMsg).slice(0, 700)}`, {
-        chat_id: msg.chat.id, message_id: status.message_id
-      }).catch(() => {});
+      await bot.sendMessage(msg.chat.id, `❌ All models failed. Last error: ${String(errorMsg).slice(0, 700)}`);
     }
       
   } catch (e) {
