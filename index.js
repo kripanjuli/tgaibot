@@ -114,7 +114,6 @@ function keyboard(models, page, settings) {
   page = Math.min(Math.max(page, 0), pages - 1);
   const start = page * PAGE_SIZE;
   const rows = models.slice(start, start + PAGE_SIZE).map((id, i) => [{
-    // Changed ❔ to 🤖 here
     text: `${id === settings.model_id ? '✅ ' : ''}${freeModels.has(id) ? '🆓 ' : '🤖 '}${id.length > 42 ? id.slice(0, 39) + '…' : id}`,
     callback_data: `pick|${page}|${start + i}`
   }]);
@@ -131,7 +130,6 @@ async function showModels(msg, page = 0, editId = null) {
   if (!models.length) throw new Error('No models returned for this API key.');
   const settings = await getSettings(msg);
   const pages = Math.max(1, Math.ceil(models.length / PAGE_SIZE));
-  // Changed ❔ to 🤖 here
   const text = `🤖 *NVIDIA models*\nSelected: \`${settings.model_id}\`\nSelection: ${settings.model_locked ? '🔒 locked' : '🔓 unlocked'}\n\n🆓 = configured as free by administrator. 🤖 = pricing unverified.\nPage ${Math.min(page + 1, pages)}/${pages}`;
   const opts = { parse_mode: 'Markdown', reply_markup: keyboard(models, page, settings) };
   
@@ -141,12 +139,48 @@ async function showModels(msg, page = 0, editId = null) {
   return bot.sendMessage(msg.chat.id, text, opts);
 }
 
+// NEW: Convert AI Standard Markdown to Telegram HTML
+function markdownToHtml(text) {
+  let html = text;
+  
+  // 1. Escape HTML tags to prevent errors
+  html = html.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  // 2. Convert bullet points (* or - at start of line) to • 
+  html = html.replace(/^\s*[*|-]\s+(.*?)$/gm, '• $1');
+
+  // 3. Convert Bold (**text** or __text__) to <b>text</b>
+  html = html.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
+  html = html.replace(/__(.*?)__/g, '<b>$1</b>');
+
+  // 4. Convert Italic (*text* or _text_) to <i>text</i>
+  html = html.replace(/\*(.*?)\*/g, '<i>$1</i>');
+  html = html.replace(/_(.*?)_/g, '<i>$1</i>');
+
+  // 5. Convert Inline Code (`code`) to <code>code</code>
+  html = html.replace(/`(.*?)`/g, '<code>$1</code>');
+
+  // 6. Convert Code Blocks (```code```) to <pre>code</pre>
+  html = html.replace(/```([\s\S]*?)```/g, '<pre>$1</pre>');
+
+  // 7. Convert Links [text](url) to <a href="url">text</a>
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+
+  return html;
+}
+
 async function sendLong(chat, content) {
   const chunks = content.match(/[\s\S]{1,3900}/g) || ['(Empty response)'];
-  for (const part of chunks) {
+  for (let part of chunks) {
+    const htmlPart = markdownToHtml(part);
     try {
-      await bot.sendMessage(chat, part, { parse_mode: 'Markdown' });
+      // Send with HTML formatting and disable big link previews
+      await bot.sendMessage(chat, htmlPart, { 
+        parse_mode: 'HTML',
+        disable_web_page_preview: true 
+      });
     } catch (error) {
+      // Fallback to plain text if parsing somehow fails
       await bot.sendMessage(chat, part);
     }
   }
