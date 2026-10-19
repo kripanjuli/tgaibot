@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: nvidia-telegram-ai-advanced
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: ADMIN_TELEGRAM_IDS
+        sync: false
+      - key: FREE_MODELS
+        value: z-ai/glm-5.3-flash
+      - key: ALLOWED_TELEGRAM_USER_IDS
+        sync: false

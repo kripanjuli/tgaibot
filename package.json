@@ -1,0 +1,15 @@
+{
+  "name": "nvidia-telegram-ai-advanced",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "node index.js" },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "openai": "^4.77.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "pg": "^8.13.1"
+  }
+}
