@@ -189,7 +189,6 @@ bot.onText(/^\/start(?:@\w+)?$/, async msg => {
   }
 });
 
-// --- REDESIGNED /HELP MENU ---
 bot.onText(/^\/help(?:@\w+)?$/, msg => {
   if (!admin(msg)) return bot.sendMessage(msg.chat.id, '⛔ Admin only.');
   
@@ -201,6 +200,7 @@ Here are the commands you can use to manage the bot:
 🤖 *Model Settings*
 • /models — Browse and select AI models
 • /model — Check your currently selected model
+• /locked — Show your currently locked AI model
 • /lock — Lock your model to prevent changes
 • /unlock — Unlock your model
 
@@ -216,6 +216,19 @@ Here are the commands you can use to manage the bot:
   `;
   
   bot.sendMessage(msg.chat.id, helpText, { parse_mode: 'Markdown' });
+});
+
+// --- NEW /locked COMMAND ---
+bot.onText(/^\/locked(?:@\w+)?$/, async msg => {
+  if (!admin(msg)) return bot.sendMessage(msg.chat.id, '⛔ Admin only.');
+  
+  const s = await getSettings(msg);
+  
+  if (!s.model_locked) {
+    return bot.sendMessage(msg.chat.id, `🔓 You do not have a locked model right now.\n\nYour current active model is: \`${s.model_id}\`\n\nUse /lock if you want to lock it.`, { parse_mode: 'Markdown' });
+  }
+  
+  bot.sendMessage(msg.chat.id, `🔒 *Your currently locked AI model is:*\n\n\`${s.model_id}\`\n\nUse /unlock if you want to change it.`, { parse_mode: 'Markdown' });
 });
 
 bot.onText(/^\/models(?:@\w+)?$/, async msg => {
