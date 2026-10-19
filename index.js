@@ -114,8 +114,9 @@ function keyboard(models, page, settings) {
   page = Math.min(Math.max(page, 0), pages - 1);
   const start = page * PAGE_SIZE;
   const rows = models.slice(start, start + PAGE_SIZE).map((id, i) => [{
-    text: `${id === settings.model_id ? '✅ ' : ''}${freeModels.has(id) ? '🆓 ' : '❔ '}${id.length > 42 ? id.slice(0, 39) + '…' : id}`,
-    callback_data: `pick|${page}|${start + i}` // index-based: always short
+    // Changed ❔ to 🤖 here
+    text: `${id === settings.model_id ? '✅ ' : ''}${freeModels.has(id) ? '🆓 ' : '🤖 '}${id.length > 42 ? id.slice(0, 39) + '…' : id}`,
+    callback_data: `pick|${page}|${start + i}`
   }]);
   const nav = [];
   if (page > 0) nav.push({ text: '⬅️ Previous', callback_data: `page|${page - 1}` });
@@ -130,7 +131,8 @@ async function showModels(msg, page = 0, editId = null) {
   if (!models.length) throw new Error('No models returned for this API key.');
   const settings = await getSettings(msg);
   const pages = Math.max(1, Math.ceil(models.length / PAGE_SIZE));
-  const text = `🤖 *NVIDIA models*\nSelected: \`${settings.model_id}\`\nSelection: ${settings.model_locked ? '🔒 locked' : '🔓 unlocked'}\n\n🆓 = configured as free by administrator. ❔ = pricing unverified.\nPage ${Math.min(page + 1, pages)}/${pages}`;
+  // Changed ❔ to 🤖 here
+  const text = `🤖 *NVIDIA models*\nSelected: \`${settings.model_id}\`\nSelection: ${settings.model_locked ? '🔒 locked' : '🔓 unlocked'}\n\n🆓 = configured as free by administrator. 🤖 = pricing unverified.\nPage ${Math.min(page + 1, pages)}/${pages}`;
   const opts = { parse_mode: 'Markdown', reply_markup: keyboard(models, page, settings) };
   
   if (editId) {
@@ -145,7 +147,6 @@ async function sendLong(chat, content) {
     try {
       await bot.sendMessage(chat, part, { parse_mode: 'Markdown' });
     } catch (error) {
-      // Fallback to plain text if the AI generates broken markdown
       await bot.sendMessage(chat, part);
     }
   }
@@ -176,7 +177,7 @@ bot.onText(/^\/models(?:@\w+)?$/, async msg => {
 bot.onText(/^\/model(?:@\w+)?$/, async msg => {
   if (!permitted(msg)) return;
   const s = await getSettings(msg);
-  bot.sendMessage(msg.chat.id, `Model: ${s.model_id}\nLock: ${s.model_locked ? '🔒 locked' : '🔓 unlocked'}\nPricing: ${freeModels.has(s.model_id) ? '🆓 configured free' : '❔ not verified'}`);
+  bot.sendMessage(msg.chat.id, `Model: ${s.model_id}\nLock: ${s.model_locked ? '🔒 locked' : '🔓 unlocked'}\nPricing: ${freeModels.has(s.model_id) ? '🆓 configured free' : '🤖 not verified'}`);
 });
 
 bot.onText(/^\/lock(?:@\w+)?$/, async msg => {
@@ -230,7 +231,6 @@ bot.onText(/^\/broadcast(?:@\w+)?\s+([\s\S]+)/, async (msg, match) => {
 bot.on('callback_query', async q => {
   if (!q.message) return bot.answerCallbackQuery(q.id, { text: 'Message unavailable', show_alert: true }).catch(() => {});
   
-  // Fix: The message author is the bot, we need to use the person clicking the button (q.from)
   const msg = { ...q.message, from: q.from };
   
   if (!permitted(msg)) return bot.answerCallbackQuery(q.id, { text: 'Access denied', show_alert: true });
@@ -319,7 +319,6 @@ async function shutdown() {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-// Database connection retry logic
 for (let attempt = 1; ; attempt++) {
   try { 
     await initDb(); 
