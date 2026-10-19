@@ -51,7 +51,6 @@ const cache = { models: [], at: 0 };
 const PAGE_SIZE = 8;
 const MAX_HISTORY = 16;
 
-// Fast fallback models in case the selected one is too slow
 const FAST_MODELS = [
   'z-ai/glm-5.3-flash', 
   'meta/llama-3.1-70b-instruct',
@@ -183,21 +182,42 @@ bot.onText(/^\/start(?:@\w+)?$/, async msg => {
   if (admin(msg)) {
     const s = await getSettings(msg);
     await bot.sendMessage(msg.chat.id,
-      `👋 *NVIDIA AI Bot (Admin)*\n\nSelected model: \`${s.model_id}\`\nLock: ${s.model_locked ? '🔒 locked' : '🔓 unlocked'}\n\n/models — browse models\n/model — current model\n/lock — lock selection\n/unlock — unlock selection\n/reset — clear saved conversation\n/help — commands`,
+      `👋 *Welcome back, Admin!*\n\nSelected model: \`${s.model_id}\`\nLock: ${s.model_locked ? '🔒 locked' : '🔓 unlocked'}\n\nUse /help to see the command menu.`,
       { parse_mode: 'Markdown' });
   } else {
-    // Regular users see this
     await bot.sendMessage(msg.chat.id, `👋 *Welcome to NVIDIA AI Bot!*\n\nJust send me a message and I will reply using AI.`);
   }
 });
 
-// Help is strictly for admin now
+// --- REDESIGNED /HELP MENU ---
 bot.onText(/^\/help(?:@\w+)?$/, msg => {
   if (!admin(msg)) return bot.sendMessage(msg.chat.id, '⛔ Admin only.');
-  bot.sendMessage(msg.chat.id, '/models, /model, /lock, /unlock, /reset, /admin, /stats');
+  
+  const helpText = `
+👑 *Admin Command Center*
+
+Here are the commands you can use to manage the bot:
+
+🤖 *Model Settings*
+• /models — Browse and select AI models
+• /model — Check your currently selected model
+• /lock — Lock your model to prevent changes
+• /unlock — Unlock your model
+
+🧹 *Utility*
+• /reset — Clear your saved conversation history
+
+👑 *Administration*
+• /admin — Open the admin panel
+• /stats — View bot usage statistics
+• /broadcast <msg> — Message all users
+
+💡 _Note: Regular users are restricted to chatting with the AI only. They cannot use these commands._
+  `;
+  
+  bot.sendMessage(msg.chat.id, helpText, { parse_mode: 'Markdown' });
 });
 
-// Locked to Admin
 bot.onText(/^\/models(?:@\w+)?$/, async msg => {
   if (!admin(msg)) return bot.sendMessage(msg.chat.id, '⛔ Admin only.');
   try { 
@@ -208,28 +228,24 @@ bot.onText(/^\/models(?:@\w+)?$/, async msg => {
   }
 });
 
-// Locked to Admin
 bot.onText(/^\/model(?:@\w+)?$/, async msg => {
   if (!admin(msg)) return bot.sendMessage(msg.chat.id, '⛔ Admin only.');
   const s = await getSettings(msg);
-  bot.sendMessage(msg.chat.id, `Model: ${s.model_id}\nLock: ${s.model_locked ? '🔒 locked' : '🔓 unlocked'}`);
+  bot.sendMessage(msg.chat.id, `Model: \`${s.model_id}\`\nLock: ${s.model_locked ? '🔒 locked' : '🔓 unlocked'}`, { parse_mode: 'Markdown' });
 });
 
-// Locked to Admin
 bot.onText(/^\/lock(?:@\w+)?$/, async msg => {
   if (!admin(msg)) return bot.sendMessage(msg.chat.id, '⛔ Admin only.');
   await getSettings(msg); await setSetting(msg, 'lock', true);
   bot.sendMessage(msg.chat.id, '🔒 Your model selection is locked.');
 });
 
-// Locked to Admin
 bot.onText(/^\/unlock(?:@\w+)?$/, async msg => {
   if (!admin(msg)) return bot.sendMessage(msg.chat.id, '⛔ Admin only.');
   await getSettings(msg); await setSetting(msg, 'lock', false);
   bot.sendMessage(msg.chat.id, '🔓 Model selection unlocked.');
 });
 
-// Locked to Admin
 bot.onText(/^\/reset(?:@\w+)?$/, async msg => {
   if (!admin(msg)) return bot.sendMessage(msg.chat.id, '⛔ Admin only.');
   await pool.query('DELETE FROM chat_messages WHERE telegram_user_id=$1', [userId(msg)]);
@@ -248,7 +264,7 @@ bot.onText(/^\/stats(?:@\w+)?$/, async msg => {
     (SELECT COUNT(*)::int FROM user_settings) AS users,
     (SELECT COUNT(*)::int FROM chat_messages WHERE role='user') AS user_messages,
     (SELECT COUNT(DISTINCT model_id)::int FROM user_settings) AS models_in_use`);
-  bot.sendMessage(msg.chat.id, `👑 Stats\nUsers: ${rows[0].users}\nUser messages saved: ${rows[0].user_messages}\nModels in use: ${rows[0].models_in_use}`);
+  bot.sendMessage(msg.chat.id, `👑 *Stats*\nUsers: ${rows[0].users}\nUser messages saved: ${rows[0].user_messages}\nModels in use: ${rows[0].models_in_use}`, { parse_mode: 'Markdown' });
 });
 
 bot.onText(/^\/broadcast(?:@\w+)?\s+([\s\S]+)/, async (msg, match) => {
