@@ -19,7 +19,7 @@ if (!NVIDIA_API_KEY || !TELEGRAM_BOT_TOKEN || !DATABASE_URL) {
 const openai = new OpenAI({
   apiKey: NVIDIA_API_KEY,
   baseURL: 'https://integrate.api.nvidia.com/v1',
-  timeout: 60_000, // Increased slightly for image processing
+  timeout: 60_000,
   maxRetries: 1
 });
 
@@ -51,19 +51,50 @@ const cache = { models: [], at: 0 };
 const PAGE_SIZE = 8;
 const MAX_HISTORY = 16;
 
-// Fallback text models
 const FAST_MODELS = [
   'z-ai/glm-5.3-flash', 
   'meta/llama-3.1-70b-instruct',
   'mistralai/mistral-7b-instruct-v0.3'
 ];
 
-// Fallback Vision models (for Images/OCR)
 const VISION_MODELS = [
   'meta/llama-3.2-11b-vision-instruct',
   'microsoft/phi-3.5-vision-instruct',
   'meta/llama-3.2-90b-vision-instruct'
 ];
+
+async function setupBotCommands() {
+  try {
+    // 1. Regular users ONLY get /start
+    const userCommands = [
+      { command: 'start', description: 'Restart the bot / Welcome message' }
+    ];
+    await bot.setMyCommands(userCommands);
+    console.log('Default command menu updated.');
+
+    // 2. Advanced commands for Admins (/lock removed)
+    const adminCommands = [
+      { command: 'start', description: 'Restart the bot' },
+      { command: 'models', description: 'Browse and select AI models' },
+      { command: 'model', description: 'Check your current model' },
+      { command: 'locked', description: 'Show your locked AI model' },
+      { command: 'unlock', description: 'Unlock model selection' },
+      { command: 'reset', description: 'Clear conversation history' },
+      { command: 'stats', description: 'View bot usage statistics' },
+      { command: 'admin', description: 'Open admin panel' },
+      { command: 'help', description: 'Admin Command Center' }
+    ];
+
+    for (const adminId of admins) {
+      await bot.setMyCommands(adminCommands, { 
+        scope: { type: 'chat', chat_id: adminId } 
+      });
+    }
+    console.log('Admin command menus updated.');
+  } catch (e) {
+    console.error('Failed to update command menus:', e.message);
+  }
+}
 
 async function initDb() {
   await pool.query(`
@@ -134,6 +165,7 @@ function keyboard(models, page, settings) {
   if (page > 0) nav.push({ text: '⬅️ Previous', callback_data: `page|${page - 1}` });
   if (page < pages - 1) nav.push({ text: 'Next ➡️', callback_data: `page|${page + 1}` });
   if (nav.length) rows.push(nav);
+  // The lock/unlock toggle button remains inside the UI
   rows.push([{ text: settings.model_locked ? '🔒 Locked' : '🔐 Lock selected model', callback_data: 'togglelock' }]);
   return { inline_keyboard: rows };
 }
@@ -206,7 +238,6 @@ bot.onText(/^\/help(?:@\w+)?$/, msg => {
 • /models — Browse and select AI models
 • /model — Check your currently selected model
 • /locked — Show your currently locked AI model
-• /lock — Lock your model to prevent changes
 • /unlock — Unlock your model
 
 🧹 *Utility*
@@ -217,7 +248,7 @@ bot.onText(/^\/help(?:@\w+)?$/, msg => {
 • /stats — View bot usage statistics
 • /broadcast <msg> — Message all users
 
-🖼 *Vision Support:* Users can send images directly to the bot for OCR (Text Extraction) or analysis. Note: Text models won't see the image, the bot automatically routes images to Vision models.
+🖼 *Vision Support:* Users can send images directly to the bot for OCR (Text Extraction) or analysis.
   `;
   
   bot.sendMessage(msg.chat.id, helpText, { parse_mode: 'Markdown' });
@@ -228,7 +259,7 @@ bot.onText(/^\/locked(?:@\w+)?$/, async msg => {
   const s = await getSettings(msg);
   
   if (!s.model_locked) {
-    return bot.sendMessage(msg.chat.id, `🔓 You do not have a locked model right now.\n\nYour current active model is: \`${s.model_id}\`\n\nUse /lock if you want to lock it.`, { parse_mode: 'Markdown' });
+    return bot.sendMessage(msg.chat.id, `🔓 You do not have a locked model right now.\n\nYour current active model is: \`${s.model_id}\`\n\nUse the /models menu to lock it.`, { parse_mode: 'Markdown' });
   }
   bot.sendMessage(msg.chat.id, `🔒 *Your currently locked AI model is:*\n\n\`${s.model_id}\`\n\nUse /unlock if you want to change it.`, { parse_mode: 'Markdown' });
 });
@@ -245,18 +276,14 @@ bot.onText(/^\/model(?:@\w+)?$/, async msg => {
   bot.sendMessage(msg.chat.id, `Model: \`${s.model_id}\`\nLock: ${s.model_locked ? '🔒 locked' : '🔓 unlocked'}`, { parse_mode: 'Markdown' });
 });
 
-bot.onText(/^\/lock(?:@\w+)?$/, async msg => {
-  if (!admin(msg)) return bot.sendMessage(msg.chat.id, '⛔ Admin only.');
-  await getSettings(msg); await setSetting(msg, 'lock', true);
-  bot.sendMessage(msg.chat.id, '🔒 Your model selection is locked.');
-});
-
+// Note: The /lock command has been removed. Use the inline keyboard in /models to lock.
 bot.onText(/^\/unlock(?:@\w+)?$/, async msg => {
   if (!admin(msg)) return bot.sendMessage(msg.chat.id, '⛔ Admin only.');
   await getSettings(msg); await setSetting(msg, 'lock', false);
   bot.sendMessage(msg.chat.id, '🔓 Model selection unlocked.');
 });
 
+// Restricted strictly to admin
 bot.onText(/^\/reset(?:@\w+)?$/, async msg => {
   if (!admin(msg)) return bot.sendMessage(msg.chat.id, '⛔ Admin only.');
   await pool.query('DELETE FROM chat_messages WHERE telegram_user_id=$1', [userId(msg)]);
@@ -323,10 +350,8 @@ bot.on('callback_query', async q => {
   }
 });
 
-// --- UPDATED MESSAGE HANDLER FOR TEXT AND IMAGES ---
 bot.on('message', async msg => {
   const isPhoto = msg.photo && msg.photo.length > 0;
-  // If it's not a photo, it must be text and not a command
   if (!isPhoto && (!msg.text || msg.text.startsWith('/'))) return;
   if (!permitted(msg)) return;
   
@@ -346,7 +371,6 @@ bot.on('message', async msg => {
     
     const status = await bot.sendMessage(msg.chat.id, isPhoto ? `⏳ Analyzing image…` : `⏳ Thinking…`);
     
-    // Determine which models to use
     const modelsToTry = isPhoto 
       ? VISION_MODELS 
       : [...new Set([settings.model_id, ...FAST_MODELS])];
@@ -355,7 +379,6 @@ bot.on('message', async msg => {
     let output = '';
     let lastError = null;
 
-    // If it's a photo, prepare the image URL
     let imageUrl = null;
     if (isPhoto) {
       const fileId = msg.photo[msg.photo.length - 1].file_id;
@@ -364,7 +387,6 @@ bot.on('message', async msg => {
 
     for (const modelId of modelsToTry) {
       try {
-        // Build message array. If photo, the current message uses vision format.
         const currentApiMsg = isPhoto ? {
           role: 'user',
           content: [
@@ -444,4 +466,7 @@ for (let attempt = 1; ; attempt++) {
     await new Promise(r => setTimeout(r, 3000));
   }
 }
+
+await setupBotCommands();
+
 console.log('Telegram bot polling started.');
